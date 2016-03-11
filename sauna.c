@@ -13,11 +13,23 @@
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 
+/*
+   Build with:
+
+   gcc -o sauna sauna.c  -I /usr/local/gdk/usr/include/nvidia/gdk -L /usr/local/gdk/usr/src/gdk/nvml/lib -lnvidia-ml
+
+   TODO
+
+   1 second and above intervals don't work.
+
+*/
+
 /* Global variables */
 
 /* BEGIN CONFGURATION */
+#define VERSION "1.0"
 //#define VERBOSE 1
-/* interval beween measurements */
+/* default interval beween measurements */
 useconds_t interval = 500000;
 /* Number of cores in the machine */
 int core_count = 1;
@@ -74,15 +86,30 @@ int main(int argc, char **argv)
    ssize_t read;
    /* Return value of NVIDIA API */
    nvmlReturn_t result;
+   /* To convert options to integers */
+   char* endp;
+   long l;
 
    /* Disable getopt error reporting */
    opterr = 0;
    /* Process options with getopt */
-   while ((c = getopt (argc, argv, "r::h::")) != -1)
+   while ((c = getopt (argc, argv, "r::h::v::i::")) != -1)
       switch (c) {
          case 'r':
             flag_roi = 1;
             break;
+         case 'i':
+            endp = NULL;
+            l = -1;
+            if (!optarg || (l=strtol(optarg, &endp, 10)), (endp && *endp)) {
+               printf("Invalid interval %s - expecting a number of miliseconds\n", optarg?optarg:"(null)");
+               close_and_exit(EXIT_FAILURE);
+            };
+            interval = l*1000;
+            break;
+         case 'v':
+            printf("sauna %s\n",VERSION);
+            close_and_exit(0);
          case 'h':
             help(argc, argv);
             close_and_exit(0);

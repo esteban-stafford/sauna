@@ -291,7 +291,7 @@ int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count) {
  
 void query_nvml_device(int device, long long delta) {
    nvmlReturn_t result;
-   int power_usage;
+   unsigned int power_usage;
    if ((result = nvmlDeviceGetPowerUsage (device_list[device], &power_usage)) != NVML_SUCCESS) {
       if (result == NVML_ERROR_NOT_SUPPORTED) {
          printf("\t This is not CUDA capable device\n");
@@ -311,7 +311,7 @@ void energy_nvml_device(int device) {
 void close_and_exit(int code) {
    nvmlReturn_t result;
    if(nvml_up) {
-      if (nvmlShutdown() != NVML_SUCCESS) {
+      if ((result = nvmlShutdown()) != NVML_SUCCESS) {
          printf("Failed to shutdown NVML: %s\n", nvmlErrorString(result));
       }
    }
@@ -321,26 +321,24 @@ void close_and_exit(int code) {
 }
 
 void print_energy() {
-   for(int i=0; i<device_count; i++)
+   int i;
+   for(i=0; i<device_count; i++)
       energy_nvml_device(i);
-   for(int i=0; i<core_count; i++)
+   for(i=0; i<core_count; i++)
       energy_rapl_device(i);
 }
 
 void alarm_handler (int signo)
 {
    int i;
-   FILE *fd;
-   size_t len;
-   char buffer[256];
    struct timeval time;
    long long delta;
 
    gettimeofday(&time,NULL);
 
-   for(int i=0; i<device_count; i++)
+   for(i=0; i<device_count; i++)
       query_nvml_device(i,interval);
-   for(int i=0; i<core_count; i++)
+   for(i=0; i<core_count; i++)
       query_rapl_device(i,interval);
 
    delta = (time.tv_sec-last_time.tv_sec)*1e6+(time.tv_usec-last_time.tv_usec);
@@ -441,7 +439,7 @@ int init_rapl_perf() {
                return -1;
             }
             else {
-               printf("error opening: %s\n",strerror(errno));
+               printf("error opening perf events: %s\n",strerror(errno));
                return -1;
             }
          }
@@ -454,7 +452,6 @@ int init_rapl_perf() {
 
 void reset_rapl_perf() {
    int i,core;
-   long long value;
 
    for(core=0; core<core_count; core++) {
       for(i=0;i<NUM_RAPL_DOMAINS;i++) {

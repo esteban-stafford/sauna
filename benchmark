@@ -1,0 +1,36 @@
+#!/usr/bin/perl
+
+use strict;
+
+$|=1;
+
+foreach(1..5000) {
+   foreach(1..10000) {
+      sqrt(58585);
+   } 
+} 
+
+foreach(1 .. ($ARGV[0] ? $ARGV[0] : 1)) {
+   print "+++ROI\n";
+   
+   foreach(1..2000) {
+      foreach(1..10000) {
+         sqrt(58585);
+      } 
+   } 
+   sleep(1);
+   foreach(1..2000) {
+      foreach(1..10000) {
+         sqrt(58585);
+      } 
+   } 
+   
+   print "---ROI\n";
+   
+   foreach(1..5000) {
+      foreach(1..10000) {
+         sqrt(58585);
+      } 
+   }
+} 
+

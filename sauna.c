@@ -1,33 +1,23 @@
 #define _GNU_SOURCE
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/wait.h>
-#include <nvml.h>
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <unistd.h>
-#include <errno.h>
 #include <ctype.h>
-#include <sys/syscall.h>
+#include <errno.h>
 #include <linux/perf_event.h>
-
-/*
-   Build with:
-
-   gcc -o sauna sauna.c  -I /usr/local/gdk/usr/include/nvidia/gdk -L /usr/local/gdk/usr/src/gdk/nvml/lib -lnvidia-ml
-
-   TODO
-
-   1 second and above intervals don't work.
-
-*/
+#include <nvml.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 /* Global variables */
 
 /* BEGIN CONFGURATION */
-#define VERSION "1.1"
+#define VERSION "1.2"
 //#define VERBOSE 1
 /* default interval beween measurements */
 useconds_t interval = 500000;
@@ -104,9 +94,13 @@ int main(int argc, char **argv)
             endp = NULL;
             l = -1;
             if (!optarg || (l=strtol(optarg, &endp, 10)), (endp && *endp)) {
-               printf("Invalid interval %s - expecting a number of miliseconds\n", optarg?optarg:"(null)");
+               printf("Invalid interval %s - expecting a number of miliseconds.\n", optarg?optarg:"(null)");
                close_and_exit(EXIT_FAILURE);
-            };
+            }
+            if (l >= 1000) {
+               printf("Interval %ld too long - should be less than 1000.\n", l);
+               close_and_exit(EXIT_FAILURE);
+            }
             interval = l*1000;
             break;
          case 'v':
@@ -132,7 +126,7 @@ int main(int argc, char **argv)
       close_and_exit (0);
    }
 
-   /* Prepare a NULL terminated array of trings to pass to execv, after the fork. */
+   /* Prepare a NULL terminated array of strings to pass to execv, after the fork. */
    for(i = optind, j = 0; i < argc; i++, j++) {
       exec_args[j] = argv[i];
    }

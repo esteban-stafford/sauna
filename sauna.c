@@ -27,12 +27,12 @@
 /* Global variables */
 
 /* BEGIN CONFGURATION */
-#define VERSION "1.0"
+#define VERSION "1.1"
 //#define VERBOSE 1
 /* default interval beween measurements */
 useconds_t interval = 500000;
-/* Number of cores in the machine */
-int core_count = 1;
+/* Maximum number of cores in a machine */
+#define MAX_CORES	256
 /* END CONFGURATION */
 
 /* Flag to know if the NVIDIA API has been initialized */
@@ -46,6 +46,8 @@ double nvml_energy[4];
 int rapl_up = 0;
 /* The last time a measurement was made. Needed to convert energy to power in RAPL measurements */
 struct timeval last_time;
+/* Number of cores detected in the machine */
+int core_count;
 
 /* Functions */
 void usage(int argc, char **argv);
@@ -353,7 +355,6 @@ int perf_event_open(struct perf_event_attr *hw_event_uptr,
 }
 
 #define NUM_RAPL_DOMAINS	4
-#define NUM_CORES	4
 
 char rapl_domain_names[NUM_RAPL_DOMAINS][30]= {
 	"cores",
@@ -363,8 +364,8 @@ char rapl_domain_names[NUM_RAPL_DOMAINS][30]= {
 };
 
 char units[BUFSIZ];
-int fd[NUM_CORES][NUM_RAPL_DOMAINS];
-long long last_value[NUM_CORES][NUM_RAPL_DOMAINS];
+int fd[MAX_CORES][NUM_RAPL_DOMAINS];
+long long last_value[MAX_CORES][NUM_RAPL_DOMAINS];
 double scale[NUM_RAPL_DOMAINS];
 
 int init_rapl_perf() {
@@ -384,6 +385,12 @@ int init_rapl_perf() {
    }
    fscanf(fff,"%d",&type);
    fclose(fff);
+
+   core_count = sysconf(_SC_NPROCESSORS_ONLN);
+   if(core_count > MAX_CORES) {
+      printf("Too many processors. Increase MAX_CORES and recompile.\n");
+      return -1;
+   }
 
    for(core=0; core<core_count; core++) {
       for(i=0;i<NUM_RAPL_DOMAINS;i++) {
@@ -432,7 +439,7 @@ int init_rapl_perf() {
          attr.type=type;
          attr.config=config;
 
-         fd[core][i]=perf_event_open(&attr,-1,core,-1,0);
+         fd[core][i]=perf_event_open(&attr,-1,core,-1,PERF_FLAG_FD_CLOEXEC);
          if (fd[core][i]<0) {
             if (errno==EACCES) {
                printf("Permission denied; run as root or adjust paranoid value\n");

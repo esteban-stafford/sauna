@@ -1,6 +1,6 @@
 
 TARGET = sauna
-LIBS = -lnvidia-ml
+LIBS = -lnvidia-ml -lpthread
 CC = gcc
 CFLAGS = -g -Wall -I/usr/include/nvidia/gdk
 

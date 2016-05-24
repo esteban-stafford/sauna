@@ -23,21 +23,43 @@
 useconds_t interval = 500000;
 /* Maximum number of cores in a machine */
 #define MAX_CORES	256
+/* Maximum number of NVLM devices */
+#define MAX_NVML 4
 /* END CONFGURATION */
 
 /* Flag to know if the NVIDIA API has been initialized */
 int nvml_up = 0;
 /* List and count of NVIDIA devices */
-nvmlDevice_t device_list[4];
+nvmlDevice_t device_list[MAX_NVML];
 unsigned int device_count;
 /* Energy accumulator for NVIDIA devices */
-double nvml_energy[4];
+double nvml_energy[MAX_NVML];
 /* Flag to know if perf RAPL events have been initialized */
 int rapl_up = 0;
 /* The last time a measurement was made. Needed to convert energy to power in RAPL measurements */
 struct timeval last_time;
 /* Number of cores detected in the machine */
-int core_count;
+int core_count = -1;
+
+/* Thread and mutex to access nvml thread */
+pthread_t nvml_thread;
+pthread_mutex_t nvml_mutex;
+pthread_barrier_t nvml_barrier;
+
+#define NUM_RAPL_DOMAINS	4
+
+char rapl_domain_names[NUM_RAPL_DOMAINS][30]= {
+	"cores",
+	"gpu",
+	"pkg",
+	"ram",
+};
+
+char units[BUFSIZ];
+int fd[MAX_CORES][NUM_RAPL_DOMAINS];
+long long last_value[MAX_CORES][NUM_RAPL_DOMAINS];
+double last_value_nvml[MAX_NVML];
+double scale[NUM_RAPL_DOMAINS];
 
 /* Functions */
 void usage(int argc, char **argv);
@@ -47,12 +69,14 @@ void query_nvml_device(int device, long long delta);
 void close_and_exit();
 void alarm_handler (int signo);
 int init_rapl_perf();
+void reset_nvml();
 void reset_rapl_perf();
 void query_rapl_device(int core,long long delta);
 void close_rapl_perf();
 void print_energy();
 void energy_nvml_device(int device);
 void energy_rapl_device(int core);
+void * monitor_nvml(void *arg);
 
 int main(int argc, char **argv)
 {
@@ -85,10 +109,19 @@ int main(int argc, char **argv)
    /* Disable getopt error reporting */
    opterr = 0;
    /* Process options with getopt */
-   while ((c = getopt (argc, argv, "r::h::v::i::")) != -1)
+   while ((c = getopt (argc, argv, "c::r::h::v::i::")) != -1)
       switch (c) {
          case 'r':
             flag_roi = 1;
+            break;
+         case 'c':
+            endp = NULL;
+            l = -1;
+            if (!optarg || (l=strtol(optarg, &endp, 10)), (endp && *endp)) {
+               printf("Invalid core count %s - expecting a number.\n", optarg?optarg:"(null)");
+               close_and_exit(EXIT_FAILURE);
+            }
+            core_count = l;
             break;
          case 'i':
             endp = NULL;
@@ -156,6 +189,28 @@ int main(int argc, char **argv)
       close_and_exit(0);
    }
 
+   /* TODO Check that MAX_NVML > device_count */
+
+   /* Initialize NVIDIA monitor mutex */
+   if(pthread_mutex_init(&nvml_mutex, NULL) != 0) {
+      printf("Error: Failed to initialize NVLM mutex.");
+      close_and_exit(0);
+   }
+
+   if(pthread_barrier_init(&nvml_barrier, NULL, 2) != 0) {
+      printf("Error: Failed to initialize NVLM barrier.");
+      close_and_exit(0);
+   }
+
+   /* Start NVIDIA monitor thread */
+   if(pthread_create(&nvml_thread, NULL, &monitor_nvml, NULL ) != 0) {
+      printf("Error: Failed to start NVLM monitoring thread.");
+      close_and_exit(0);
+   }
+   /* Wait for nvml thread to make first measurement */
+   pthread_barrier_wait(&nvml_barrier);
+
+
    /* Initialize perf RAPL */
    if(init_rapl_perf() < 0) {
       printf ("Error: Failed to intialize perf RAPL events.\n");
@@ -192,6 +247,7 @@ int main(int argc, char **argv)
 
    /* If the ROI analysis flag is not set, start measurements immediately */
    if(! flag_roi) {
+      reset_nvml();
       reset_rapl_perf();
       ualarm(interval, interval);
       gettimeofday(&last_time,NULL);
@@ -200,13 +256,14 @@ int main(int argc, char **argv)
    while ((read = getline(&line, &len, child_stdout)) != -1) {
       /* If ROI analysis is set, and begining of ROI is detected start measurements */
       if(flag_roi && strstr(line, "++ROI")) {
+         reset_nvml();
          reset_rapl_perf();
          ualarm(interval, interval);
          gettimeofday(&last_time,NULL);
       }
       /* Stop measurements at the end of the ROI */
       else if(flag_roi && strstr(line, "--ROI")) {
-         flag_roi = 2;
+         flag_roi = 1;
          ualarm(0, interval);
          print_energy();
       }
@@ -250,6 +307,82 @@ void help(int argc, char **argv) {
             );
 }
 
+double get_seconds() { /* routine to read time */
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+void * monitor_nvml(void *arg) {
+   int i;
+   unsigned int power[MAX_NVML];
+   double last_time, current_time;
+    
+   /* First iteration */
+   last_time = get_seconds();
+
+   usleep(14992); // 66.7 Hz 
+   pthread_barrier_wait(&nvml_barrier);
+   /* Next iterations */
+   while(1) {
+      current_time = get_seconds();
+      for(i=0; i<device_count; i++) {
+         nvmlDeviceGetPowerUsage (device_list[i], &power[i]);
+      }
+      pthread_mutex_lock( &nvml_mutex );
+      for(i=0; i<device_count; i++) {
+         nvml_energy[i] += (double)power[i]/1000.0*(current_time-last_time);
+      }
+      pthread_mutex_unlock( &nvml_mutex ); 
+      last_time = current_time;
+      usleep(14992); // 66.7 Hz 
+   }
+   return NULL;
+}
+/* cat raw.dat | sed 'n; d' | perl -nle '@b=split(" "); push @a,[@b] if($#a < 0 || $b[1] != $a[$#a][1] || $b[0] - $a[$#a][0] > 0.004); sub END { print $#a; print join("\n", map { join(" ",$a[$_][0],$a[$_][1]+0.04*($a[$_+1][1]-$a[$_-1][1])/($a[$_+1][0]-$a[$_-1][0]))} 0..$#a); }' > cook.dat 
+      echo 'plot "cook.dat" u 1:2 w lp'  | gnuplot -persist
+
+void * monitor_nvml(void *arg) {
+   int i;
+   nvmlReturn_t result;
+   unsigned int nvml_last[MAX_NVML][2], power_nvml;
+   double nvml_timestamp[MAX_NVML][2], current_time, power_true;
+    
+
+   for(i=0; i<device_count; i++) {
+      nvmlDeviceGetPowerUsage (device_list[i], &power_nvml);
+      nvml_timestamp[i][0] = nvml_timestamp[i][1] = get_seconds();
+      nvml_last[i][0] = nvml_last[i][1] = power_nvml;
+   }
+
+   FILE *f = fopen("raw.dat","w");
+   while(1) {
+      for(i=0; i<device_count; i++) {
+         nvmlDeviceGetPowerUsage (device_list[i], &power_nvml);
+         current_time = get_seconds();
+         fprintf(f,"%lf %u\n",current_time,power_nvml);
+         if(power_nvml == nvml_last[i][0] && current_time-nvml_timestamp[i][0] < 4e3)
+            continue;
+         
+         power_true = (double)nvml_last[i][0]+0.84*(power_nvml-nvml_last[i][1])/(current_time-nvml_timestamp[i][1]);
+
+         if(power_true > 52.5) {
+            pthread_mutex_lock( &nvml_mutex );
+            nvml_energy[i] += (double)power_true*(current_time-nvml_timestamp[i][0]);
+            pthread_mutex_unlock( &nvml_mutex ); 
+         }
+         nvml_timestamp[i][1] = nvml_timestamp[i][0];
+         nvml_timestamp[i][0] = current_time;
+         nvml_last[i][1] = nvml_last[i][0];
+         nvml_last[i][0] = power_nvml;
+      }
+      usleep(14992); // 66.7 Hz 
+      //usleep(3748); // 266.8 Hz 
+   }
+   return NULL;
+}
+*/
+
 int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count) {
    int i;
    nvmlReturn_t result;
@@ -285,19 +418,26 @@ int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count) {
    return NVML_SUCCESS;
 }
  
-void query_nvml_device(int device, long long delta) {
-   nvmlReturn_t result;
-   unsigned int power_usage;
-   if ((result = nvmlDeviceGetPowerUsage (device_list[device], &power_usage)) != NVML_SUCCESS) {
-      if (result == NVML_ERROR_NOT_SUPPORTED) {
-         printf("\t This is not CUDA capable device\n");
-      }
-      else {
-         close_and_exit(0);
-      }
+void reset_nvml() {
+   int i;
+   pthread_mutex_lock( &nvml_mutex );
+   for(i=0; i<device_count; i++) {
+      last_value_nvml[i] = nvml_energy[i];
    }
-   printf("nvd[%d].power = %f\n",device,(double)power_usage/1000);
-   nvml_energy[device] += (double)power_usage*interval*1e-9;
+   pthread_mutex_unlock( &nvml_mutex );
+
+}
+
+void query_nvml_device(int device, long long delta) {
+   double current_energy;
+   
+   pthread_mutex_lock( &nvml_mutex );
+   current_energy = nvml_energy[device];
+   pthread_mutex_unlock( &nvml_mutex );
+
+   printf("nvd[%d].power = %f\n",device,(current_energy-last_value_nvml[device])/delta*1e6);
+
+   last_value_nvml[device] = current_energy;
 }
 
 void energy_nvml_device(int device) {
@@ -310,6 +450,8 @@ void close_and_exit(int code) {
       if ((result = nvmlShutdown()) != NVML_SUCCESS) {
          printf("Failed to shutdown NVML: %s\n", nvmlErrorString(result));
       }
+//      pthread_mutex_destroy( &nvml_mutex ); 
+//      pthread_cancel(nvml_thread);
    }
    if(rapl_up)
       close_rapl_perf();
@@ -348,20 +490,6 @@ int perf_event_open(struct perf_event_attr *hw_event_uptr,
                         group_fd, flags);
 }
 
-#define NUM_RAPL_DOMAINS	4
-
-char rapl_domain_names[NUM_RAPL_DOMAINS][30]= {
-	"cores",
-	"gpu",
-	"pkg",
-	"ram",
-};
-
-char units[BUFSIZ];
-int fd[MAX_CORES][NUM_RAPL_DOMAINS];
-long long last_value[MAX_CORES][NUM_RAPL_DOMAINS];
-double scale[NUM_RAPL_DOMAINS];
-
 int init_rapl_perf() {
 
    FILE *fff;
@@ -380,7 +508,8 @@ int init_rapl_perf() {
    fscanf(fff,"%d",&type);
    fclose(fff);
 
-   core_count = sysconf(_SC_NPROCESSORS_ONLN);
+   if(core_count < 0)
+      core_count = sysconf(_SC_NPROCESSORS_ONLN);
    if(core_count > MAX_CORES) {
       printf("Too many processors. Increase MAX_CORES and recompile.\n");
       return -1;

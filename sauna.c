@@ -18,10 +18,6 @@
 
    gcc -o sauna sauna.c  -I /usr/local/gdk/usr/include/nvidia/gdk -L /usr/local/gdk/usr/src/gdk/nvml/lib -lnvidia-ml
 
-   TODO
-
-   1 second and above intervals don't work.
-
 */
 
 /* Global variables */
@@ -40,14 +36,28 @@ int nvml_up = 0;
 /* List and count of NVIDIA devices */
 nvmlDevice_t device_list[4];
 unsigned int device_count;
-/* Energy accumulator for NVIDIA devices */
-double nvml_energy[4];
 /* Flag to know if perf RAPL events have been initialized */
 int rapl_up = 0;
 /* The last time a measurement was made. Needed to convert energy to power in RAPL measurements */
 struct timeval last_time;
 /* Number of cores detected in the machine */
-int core_count;
+int core_count = 2;
+int query_cores[] = {0,6};
+
+/* Textual description of the RAPL domains */
+#define NUM_RAPL_DOMAINS	4
+char rapl_domain_names[NUM_RAPL_DOMAINS][30]= {
+	"cores",
+	"gpu",
+	"pkg",
+	"ram",
+};
+/* File descriptors to read the RAPL counters */
+int fd[MAX_CORES][NUM_RAPL_DOMAINS];
+/* Last value read from RAPL counters to compute power from energy */
+long long last_value[MAX_CORES][NUM_RAPL_DOMAINS];
+/* Scale factor when reading RAPL counters */
+double scale[NUM_RAPL_DOMAINS];
 
 /* Functions */
 void usage(int argc, char **argv);
@@ -60,9 +70,6 @@ int init_rapl_perf();
 void reset_rapl_perf();
 void query_rapl_device(int core,long long delta);
 void close_rapl_perf();
-void print_energy();
-void energy_nvml_device(int device);
-void energy_rapl_device(int core);
 
 int main(int argc, char **argv)
 {
@@ -95,22 +102,35 @@ int main(int argc, char **argv)
    /* Disable getopt error reporting */
    opterr = 0;
    /* Process options with getopt */
-   while ((c = getopt (argc, argv, "r::h::v::i::")) != -1)
+   while ((c = getopt (argc, argv, "c::r::h::v::i::")) != -1)
       switch (c) {
          case 'r':
             flag_roi = 1;
             break;
+/*         case 'c':
+            endp = NULL;
+            l = -1;
+            if (!optarg || (l=strtol(optarg, &endp, 10)), (endp && *endp)) {
+               fprintf(stderr,"Invalid core count %s - expecting a number.\n", optarg?optarg:"(null)");
+               close_and_exit(EXIT_FAILURE);
+            }
+            core_count = l;
+            break; */
          case 'i':
             endp = NULL;
             l = -1;
             if (!optarg || (l=strtol(optarg, &endp, 10)), (endp && *endp)) {
-               printf("Invalid interval %s - expecting a number of miliseconds\n", optarg?optarg:"(null)");
+               fprintf(stderr,"Invalid interval %s - expecting a number of miliseconds.\n", optarg?optarg:"(null)");
                close_and_exit(EXIT_FAILURE);
-            };
+            }
+            if (l >= 1000) {
+               fprintf(stderr,"Interval %ld too long - should be less than 1000.\n", l);
+               close_and_exit(EXIT_FAILURE);
+            }
             interval = l*1000;
             break;
          case 'v':
-            printf("sauna %s\n",VERSION);
+            fprintf(stderr,"sauna %s\n",VERSION);
             close_and_exit(0);
          case 'h':
             help(argc, argv);
@@ -132,7 +152,7 @@ int main(int argc, char **argv)
       close_and_exit (0);
    }
 
-   /* Prepare a NULL terminated array of trings to pass to execv, after the fork. */
+   /* Prepare a NULL terminated array of strings to pass to execv, after the fork. */
    for(i = optind, j = 0; i < argc; i++, j++) {
       exec_args[j] = argv[i];
    }
@@ -152,16 +172,17 @@ int main(int argc, char **argv)
 
    /* Initialize NVIDIA API */
    if ((result = nvmlInit()) != NVML_SUCCESS) {
-      printf("Error: Failed to initialize NVML: %s\n", nvmlErrorString(result));
+      fprintf(stderr,"Error: Failed to initialize NVML: %s\n", nvmlErrorString(result));
       close_and_exit(0);
    }
    nvml_up = 1;
 
    if((result = list_nvidia_devices(device_list,&device_count)) != NVML_SUCCESS) {
-      printf("Error: Failed to list NVIDIA devices: %s\n", nvmlErrorString(result));
+      fprintf(stderr,"Error: Failed to list NVIDIA devices: %s\n", nvmlErrorString(result));
       close_and_exit(0);
    }
 
+   /* TODO Check that MAX_NVML > device_count */
    /* Initialize perf RAPL */
    if(init_rapl_perf() < 0) {
       printf ("Error: Failed to intialize perf RAPL events.\n");
@@ -186,8 +207,8 @@ int main(int argc, char **argv)
       if(execvp(exec_args[0],exec_args) == -1) {
          printf ("Error: failed to exec \"%s\" in child process. %s\n",exec_args[0],strerror(errno));
 /*         for(i = 0; exec_args[i] != NULL; i++) 
-              printf("%s%s",exec_args[i],exec_args[i+1] != NULL ? " ": "");
-           printf("\n");
+              fprintf(stderr,"%s%s",exec_args[i],exec_args[i+1] != NULL ? " ": "");
+           fprintf(stderr,"\n");
           */
       }
       close_and_exit(1);
@@ -195,6 +216,18 @@ int main(int argc, char **argv)
 
    signal (SIGALRM, alarm_handler);
    close(pipe_stdout[1]); 
+   
+   /* Print headers */
+   fprintf(stderr,"time ");
+   for(i=0; i<core_count; i++)
+      for(j=0;j<NUM_RAPL_DOMAINS;j++) {
+         if (fd[i][j]!=-1) {
+            fprintf(stderr,"core_%d.%s ",query_cores[i],rapl_domain_names[j]);
+         }
+      }
+   for(i=0; i<device_count; i++)
+     fprintf(stderr,"nvd_%d ",i);
+   fprintf(stderr,"\n");
 
    /* If the ROI analysis flag is not set, start measurements immediately */
    if(! flag_roi) {
@@ -212,16 +245,14 @@ int main(int argc, char **argv)
       }
       /* Stop measurements at the end of the ROI */
       else if(flag_roi && strstr(line, "--ROI")) {
-         flag_roi = 2;
+         flag_roi = 1;
          ualarm(0, interval);
-         print_energy();
       }
       fputs(line, stdout);
    }
    /* Stop measurements when the child dies */
    if(flag_roi < 1) {
       ualarm(0, interval);
-      print_energy();
    }
 
    /* Reap child */
@@ -251,6 +282,10 @@ void help(int argc, char **argv) {
             "      is considered from the instant when <command> writes the string \"+++ROI\" to\n"
             "      stdout, to the moment it writes \"---ROI\" or its execution ends.\n"
             "\n"
+            "   -i Sets the sampling interval in ms. Default 500ms. Interval can not exceed 999ms. \n"
+            "\n"
+            "   -v Show version number.\n"
+            "\n"
             "   -h Displays this message.\n"
             "\n"
             );
@@ -262,11 +297,11 @@ int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count) {
    char name[NVML_DEVICE_NAME_BUFFER_SIZE];
 
    if ((result = nvmlDeviceGetCount(device_count)) != NVML_SUCCESS) {
-      printf("Error: Failed to query device count: %s\n", nvmlErrorString(result));
+      fprintf(stderr,"Error: Failed to query device count: %s\n", nvmlErrorString(result));
       close_and_exit(0);
    }
 #ifdef VERBOSE
-   printf("Found %d device%s\n\n", *device_count, *device_count != 1 ? "s" : "");
+   fprintf(stderr,"Found %d NVI device%s\n\n", *device_count, *device_count != 1 ? "s" : "");
 #endif
 
    for (i = 0; i < *device_count; i++)
@@ -277,16 +312,15 @@ int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count) {
        // nvmlDeviceGetHandleByPciBusId
        if ((result = nvmlDeviceGetHandleByIndex(i, &device_list[i])) != NVML_SUCCESS)
        { 
-       //   printf("Failed to get handle for device %i: %s\n", i, nvmlErrorString(result));
+       //   fprintf(stderr,"Failed to get handle for device %i: %s\n", i, nvmlErrorString(result));
           return result;
        }
 
        if ((result = nvmlDeviceGetName(device_list[i], name, NVML_DEVICE_NAME_BUFFER_SIZE)) != NVML_SUCCESS)
        { 
-       //   printf("Failed to get name of device %i: %s\n", i, nvmlErrorString(result));
+       //   fprintf(stderr,"Failed to get name of device %i: %s\n", i, nvmlErrorString(result));
           return result;
        }
-       nvml_energy[i] = 0.0;
    }
    return NVML_SUCCESS;
 }
@@ -294,27 +328,24 @@ int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count) {
 void query_nvml_device(int device, long long delta) {
    nvmlReturn_t result;
    unsigned int power_usage;
+   
    if ((result = nvmlDeviceGetPowerUsage (device_list[device], &power_usage)) != NVML_SUCCESS) {
       if (result == NVML_ERROR_NOT_SUPPORTED) {
-         printf("\t This is not CUDA capable device\n");
+         fprintf(stderr,"\t This is not CUDA capable device\n");
       }
       else {
          close_and_exit(0);
       }
    }
-   printf("nvd[%d].power = %f\n",device,(double)power_usage/1000);
-   nvml_energy[device] += (double)power_usage*interval*1e-9;
-}
 
-void energy_nvml_device(int device) {
-   printf("nvd[%d].energy = %f\n",device,nvml_energy[device]);
+   fprintf(stderr,"%f ",(double)power_usage/1000);
 }
 
 void close_and_exit(int code) {
    nvmlReturn_t result;
    if(nvml_up) {
       if ((result = nvmlShutdown()) != NVML_SUCCESS) {
-         printf("Failed to shutdown NVML: %s\n", nvmlErrorString(result));
+         fprintf(stderr,"Failed to shutdown NVML: %s\n", nvmlErrorString(result));
       }
    }
    if(rapl_up)
@@ -322,29 +353,24 @@ void close_and_exit(int code) {
    exit(code);
 }
 
-void print_energy() {
-   int i;
-   for(i=0; i<device_count; i++)
-      energy_nvml_device(i);
-   for(i=0; i<core_count; i++)
-      energy_rapl_device(i);
-}
-
 void alarm_handler (int signo)
 {
    int i;
    struct timeval time;
-   long long delta;
+   double now;
+   static double before = 0;
 
    gettimeofday(&time,NULL);
 
+   now = (time.tv_sec-last_time.tv_sec)+(time.tv_usec-last_time.tv_usec)*1e-6;
+   if(before == 0) before = now-interval;
+   fprintf(stderr,"%f ",(double) now);
+   for(i=0; i<core_count; i++)
+      query_rapl_device(i,(now-before)*1e6);
    for(i=0; i<device_count; i++)
       query_nvml_device(i,interval);
-   for(i=0; i<core_count; i++)
-      query_rapl_device(i,interval);
-
-   delta = (time.tv_sec-last_time.tv_sec)*1e6+(time.tv_usec-last_time.tv_usec);
-   printf("time = %lld\n",delta);
+   fprintf(stderr,"\n");
+   before = now;
 }
 
 int perf_event_open(struct perf_event_attr *hw_event_uptr,
@@ -354,58 +380,47 @@ int perf_event_open(struct perf_event_attr *hw_event_uptr,
                         group_fd, flags);
 }
 
-#define NUM_RAPL_DOMAINS	4
-
-char rapl_domain_names[NUM_RAPL_DOMAINS][30]= {
-	"cores",
-	"gpu",
-	"pkg",
-	"ram",
-};
-
-char units[BUFSIZ];
-int fd[MAX_CORES][NUM_RAPL_DOMAINS];
-long long last_value[MAX_CORES][NUM_RAPL_DOMAINS];
-double scale[NUM_RAPL_DOMAINS];
-
 int init_rapl_perf() {
 
    FILE *fff;
    int type;
-   int core;
    int config=0;
    char filename[BUFSIZ];
+   char units[BUFSIZ];
    struct perf_event_attr attr;
-   int i;
+   int i,j;
 
    fff=fopen("/sys/bus/event_source/devices/power/type","r");
    if (fff==NULL) {
-      printf("No perf_event rapl support found (requires Linux 3.14)\n");
+      fprintf(stderr,"No perf_event rapl support found (requires Linux 3.14)\n");
       return -1;
    }
    fscanf(fff,"%d",&type);
    fclose(fff);
 
-   core_count = sysconf(_SC_NPROCESSORS_ONLN);
+/*   core_count = sysconf(_SC_NPROCESSORS_ONLN);
    if(core_count > MAX_CORES) {
-      printf("Too many processors. Increase MAX_CORES and recompile.\n");
+      fprintf(stderr,"Too many processors. Increase MAX_CORES and recompile.\n");
       return -1;
-   }
+   } */
 
-   for(core=0; core<core_count; core++) {
-      for(i=0;i<NUM_RAPL_DOMAINS;i++) {
+   for(i=0; i<core_count; i++) {
+      for(j=0;j<NUM_RAPL_DOMAINS;j++) {
 
-         fd[core][i]=-1;
+#ifdef VERBOSE
+         fprintf(stderr,"Trying core %d with RAPL domain %s (%d)\n",query_cores[i],rapl_domain_names[j],j);
+#endif
+         fd[i][j]=-1;
 
          sprintf(filename,"/sys/bus/event_source/devices/power/events/energy-%s",
-               rapl_domain_names[i]);
+               rapl_domain_names[j]);
 
          fff=fopen(filename,"r");
 
          if (fff!=NULL) {
             fscanf(fff,"event=%x",&config);
 #ifdef VERBOSE
-            printf("Found config=%d\n",config);
+            fprintf(stderr,"Found config=%d\n",config);
 #endif
             fclose(fff);
          } else {
@@ -413,25 +428,25 @@ int init_rapl_perf() {
          }
 
          sprintf(filename,"/sys/bus/event_source/devices/power/events/energy-%s.scale",
-               rapl_domain_names[i]);
+               rapl_domain_names[j]);
          fff=fopen(filename,"r");
 
          if (fff!=NULL) {
-            fscanf(fff,"%lf",&scale[i]);
+            fscanf(fff,"%lf",&scale[j]);
 #ifdef VERBOSE
-            printf("Found scale=%g\n",scale[i]);
+            fprintf(stderr,"Found scale=%g\n",scale[j]);
 #endif
             fclose(fff);
          }
 
          sprintf(filename,"/sys/bus/event_source/devices/power/events/energy-%s.unit",
-               rapl_domain_names[i]);
+               rapl_domain_names[j]);
          fff=fopen(filename,"r");
 
          if (fff!=NULL) {
             fscanf(fff,"%s",units);
 #ifdef VERBOSE
-            printf("Found units=%s\n",units);
+            fprintf(stderr,"Found units=%s\n",units);
 #endif
             fclose(fff);
          }
@@ -439,18 +454,18 @@ int init_rapl_perf() {
          attr.type=type;
          attr.config=config;
 
-         fd[core][i]=perf_event_open(&attr,-1,core,-1,PERF_FLAG_FD_CLOEXEC);
-         if (fd[core][i]<0) {
+         fd[i][j]=perf_event_open(&attr,-1,query_cores[i],-1,PERF_FLAG_FD_CLOEXEC);
+         if (fd[i][j]<0) {
             if (errno==EACCES) {
-               printf("Permission denied; run as root or adjust paranoid value\n");
+               fprintf(stderr,"Permission denied; run as root or adjust paranoid value\n");
                return -1;
             }
             else {
-               printf("error opening perf events: %s\n",strerror(errno));
+               fprintf(stderr,"error opening perf events: %s\n",strerror(errno));
                return -1;
             }
          }
-         last_value[core][i] = 0;
+         last_value[i][j] = 0;
       }
    }
    rapl_up = 1;
@@ -475,21 +490,8 @@ void query_rapl_device(int core,long long delta) {
    for(i=0;i<NUM_RAPL_DOMAINS;i++) {
       if (fd[core][i]!=-1) {
          read(fd[core][i],&value,8);
-         printf("core[%d].%s.power = %lf\n",core,rapl_domain_names[i],
-                (double)(value-last_value[core][i])*scale[i]/delta/1e-6);
+         fprintf(stderr,"%lf ",(double)(value-last_value[core][i])*scale[i]/delta/1e-6);
          last_value[core][i] = value;
-      }
-   }
-}
-
-void energy_rapl_device(int core) {
-   int i;
-   long long value;
-   for(i=0;i<NUM_RAPL_DOMAINS;i++) {
-      if (fd[core][i]!=-1) {
-         read(fd[core][i],&value,8);
-         printf("core[%d].%s.energy = %lf\n",core,rapl_domain_names[i],
-                (double)value*scale[i]);
       }
    }
 }

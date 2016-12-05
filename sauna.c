@@ -36,6 +36,8 @@ int nvml_up = 0;
 /* List and count of NVIDIA devices */
 nvmlDevice_t device_list[4];
 unsigned int device_count;
+/* Cumulative energy for NVIDIA devices */
+double nvml_energy[4];
 /* Flag to know if perf RAPL events have been initialized */
 int rapl_up = 0;
 /* The last time a measurement was made. Needed to convert energy to power in RAPL measurements */
@@ -54,6 +56,8 @@ char rapl_domain_names[NUM_RAPL_DOMAINS][30]= {
 };
 /* File descriptors to read the RAPL counters */
 int fd[MAX_CORES][NUM_RAPL_DOMAINS];
+/* Energy at the begining of the ROI */
+long long first_value[MAX_CORES][NUM_RAPL_DOMAINS];
 /* Last value read from RAPL counters to compute power from energy */
 long long last_value[MAX_CORES][NUM_RAPL_DOMAINS];
 /* Scale factor when reading RAPL counters */
@@ -65,12 +69,16 @@ FILE *out;
 void usage(int argc, char **argv);
 void help(int argc, char **argv);
 int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count);
-void query_nvml_device(int device, long long delta);
+void reset_nvml();
+void query_nvml_device_power(int device, long long delta);
+void query_nvml_device_energy(int device);
 void close_and_exit();
 void alarm_handler (int signo);
+void print_total_energy();
 int init_rapl_perf();
 void reset_rapl_perf();
-void query_rapl_device(int core,long long delta);
+void query_rapl_device_power(int core,long long delta);
+void query_rapl_device_energy(int core);
 void close_rapl_perf();
 
 int main(int argc, char **argv)
@@ -81,6 +89,8 @@ int main(int argc, char **argv)
    int c = 0;
    /* Flag to indicate if only the ROI has to be measured */
    int flag_roi = 0;
+   /* Flag to force output of total energy and time */
+   int flag_total = 0;
 
    /* Pid of child and return status */
    pid_t child_id;
@@ -106,7 +116,7 @@ int main(int argc, char **argv)
    /* Disable getopt error reporting */
    opterr = 0;
    /* Process options with getopt */
-   while ((c = getopt (argc, argv, "o::c::r::h::v::i::")) != -1)
+   while ((c = getopt (argc, argv, "o::c::r::h::v::i::t::")) != -1)
       switch (c) {
          case 'o':
             if((out = fopen(optarg,"w")) == NULL) {
@@ -116,6 +126,9 @@ int main(int argc, char **argv)
             break;
          case 'r':
             flag_roi = 1;
+            break;
+         case 't':
+            flag_total = 1;
             break;
 /*         case 'c':
             endp = NULL;
@@ -228,20 +241,21 @@ int main(int argc, char **argv)
    close(pipe_stdout[1]); 
    
    /* Print headers */
-   fprintf(out,"time ");
+   fprintf(out,"time");
    for(i=0; i<core_count; i++)
       for(j=0;j<NUM_RAPL_DOMAINS;j++) {
          if (fd[i][j]!=-1) {
-            fprintf(out,"core_%d.%s ",query_cores[i],rapl_domain_names[j]);
+            fprintf(out," core_%d_%s",query_cores[i],rapl_domain_names[j]);
          }
       }
    for(i=0; i<device_count; i++)
-     fprintf(out,"nvd_%d ",i);
+     fprintf(out," nvd_%d",i);
    fprintf(out,"\n");
 
    /* If the ROI analysis flag is not set, start measurements immediately */
    if(! flag_roi) {
       reset_rapl_perf();
+      reset_nvml();
       ualarm(interval, interval);
       gettimeofday(&last_time,NULL);
    }
@@ -250,6 +264,7 @@ int main(int argc, char **argv)
       /* If ROI analysis is set, and begining of ROI is detected start measurements */
       if(flag_roi && strstr(line, "++ROI")) {
          reset_rapl_perf();
+         reset_nvml();
          ualarm(interval, interval);
          gettimeofday(&last_time,NULL);
       }
@@ -257,12 +272,14 @@ int main(int argc, char **argv)
       else if(flag_roi && strstr(line, "--ROI")) {
          flag_roi = 1;
          ualarm(0, interval);
+         if(flag_total != 0) print_total_energy();
       }
       fputs(line, stdout);
    }
    /* Stop measurements when the child dies */
    if(flag_roi < 1) {
       ualarm(0, interval);
+      if(flag_total != 0) print_total_energy();
    }
 
    /* Reap child */
@@ -291,6 +308,10 @@ void help(int argc, char **argv) {
             "   -r Forces the measurements to be performed within a region of interest (ROI). The ROI\n"
             "      is considered from the instant when <command> writes the string \"+++ROI\" to\n"
             "      stdout, to the moment it writes \"---ROI\" or its execution ends.\n"
+            "\n"
+            "   -t Causes the total time and energy to be written to the output file.\n"
+            "\n"
+            "   -o Sets the output file. By default it sends data to stdout. \n"
             "\n"
             "   -i Sets the sampling interval in ms. Default 500ms. Interval can not exceed 999ms. \n"
             "\n"
@@ -331,11 +352,18 @@ int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count) {
        //   fprintf(stderr,"Failed to get name of device %i: %s\n", i, nvmlErrorString(result));
           return result;
        }
+       nvml_energy[i] = 0;
    }
    return NVML_SUCCESS;
 }
+
+void reset_nvml() {
+   int i;
+   for (i = 0; i < device_count; i++)
+      nvml_energy[i] = 0;
+}
  
-void query_nvml_device(int device, long long delta) {
+void query_nvml_device_power(int device, long long delta) {
    nvmlReturn_t result;
    unsigned int power_usage;
    
@@ -347,8 +375,12 @@ void query_nvml_device(int device, long long delta) {
          close_and_exit(0);
       }
    }
-
+   nvml_energy[device] += (double)power_usage/1000*delta*1e-6;
    fprintf(out,"%f ",(double)power_usage/1000);
+}
+
+void query_nvml_device_energy(int device) {
+   fprintf(out,"%f ",nvml_energy[device]);
 }
 
 void close_and_exit(int code) {
@@ -376,11 +408,26 @@ void alarm_handler (int signo)
    if(before == 0) before = now-interval;
    fprintf(out,"%f ",(double) now);
    for(i=0; i<core_count; i++)
-      query_rapl_device(i,(now-before)*1e6);
+      query_rapl_device_power(i,(now-before)*1e6);
    for(i=0; i<device_count; i++)
-      query_nvml_device(i,interval);
+      query_nvml_device_power(i,interval);
    fprintf(out,"\n");
    before = now;
+}
+
+void print_total_energy() {
+   int i;
+   struct timeval time;
+
+   fprintf(out,"Totals: ");
+   gettimeofday(&time,NULL);
+
+   fprintf(out,"%f ",(double) (time.tv_sec-last_time.tv_sec)+(time.tv_usec-last_time.tv_usec)*1e-6);
+   for(i=0; i<core_count; i++)
+      query_rapl_device_energy(i);
+   for(i=0; i<device_count; i++)
+      query_nvml_device_energy(i);
+   fprintf(out,"\n");
 }
 
 int perf_event_open(struct perf_event_attr *hw_event_uptr,
@@ -475,6 +522,7 @@ int init_rapl_perf() {
                return -1;
             }
          }
+         first_value[i][j] = 0;
          last_value[i][j] = 0;
       }
    }
@@ -489,12 +537,13 @@ void reset_rapl_perf() {
       for(i=0;i<NUM_RAPL_DOMAINS;i++) {
          if (fd[core][i]!=-1) {
             read(fd[core][i],&last_value[core][i],8);
+            first_value[core][i] = last_value[core][i];
          }
       }
    }
 }
 
-void query_rapl_device(int core,long long delta) {
+void query_rapl_device_power(int core,long long delta) {
    int i;
    long long value;
    for(i=0;i<NUM_RAPL_DOMAINS;i++) {
@@ -502,6 +551,17 @@ void query_rapl_device(int core,long long delta) {
          read(fd[core][i],&value,8);
          fprintf(out,"%lf ",(double)(value-last_value[core][i])*scale[i]/delta/1e-6);
          last_value[core][i] = value;
+      }
+   }
+}
+
+void query_rapl_device_energy(int core) {
+   int i;
+   long long value;
+   for(i=0;i<NUM_RAPL_DOMAINS;i++) {
+      if (fd[core][i]!=-1) {
+         read(fd[core][i],&value,8);
+         fprintf(out,"%lf ",(double)(value-first_value[core][i])*scale[i]);
       }
    }
 }

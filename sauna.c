@@ -23,7 +23,7 @@
 /* Global variables */
 
 /* BEGIN CONFGURATION */
-#define VERSION "1.1"
+#define VERSION "1.2"
 //#define VERBOSE 1
 /* default interval beween measurements */
 useconds_t interval = 500000;
@@ -58,6 +58,8 @@ int fd[MAX_CORES][NUM_RAPL_DOMAINS];
 long long last_value[MAX_CORES][NUM_RAPL_DOMAINS];
 /* Scale factor when reading RAPL counters */
 double scale[NUM_RAPL_DOMAINS];
+/* File desctiptor for output file */
+FILE *out;
 
 /* Functions */
 void usage(int argc, char **argv);
@@ -98,12 +100,20 @@ int main(int argc, char **argv)
    /* To convert options to integers */
    char* endp;
    long l;
+   /* Set default output file */
+   out = stderr;
 
    /* Disable getopt error reporting */
    opterr = 0;
    /* Process options with getopt */
-   while ((c = getopt (argc, argv, "c::r::h::v::i::")) != -1)
+   while ((c = getopt (argc, argv, "o::c::r::h::v::i::")) != -1)
       switch (c) {
+         case 'o':
+            if((out = fopen(optarg,"w")) == NULL) {
+               fprintf(stderr,"Could not open output file %s for writing. %s\n", optarg, strerror(errno));
+               close_and_exit(EXIT_FAILURE);
+            }
+            break;
          case 'r':
             flag_roi = 1;
             break;
@@ -218,16 +228,16 @@ int main(int argc, char **argv)
    close(pipe_stdout[1]); 
    
    /* Print headers */
-   fprintf(stderr,"time ");
+   fprintf(out,"time ");
    for(i=0; i<core_count; i++)
       for(j=0;j<NUM_RAPL_DOMAINS;j++) {
          if (fd[i][j]!=-1) {
-            fprintf(stderr,"core_%d.%s ",query_cores[i],rapl_domain_names[j]);
+            fprintf(out,"core_%d.%s ",query_cores[i],rapl_domain_names[j]);
          }
       }
    for(i=0; i<device_count; i++)
-     fprintf(stderr,"nvd_%d ",i);
-   fprintf(stderr,"\n");
+     fprintf(out,"nvd_%d ",i);
+   fprintf(out,"\n");
 
    /* If the ROI analysis flag is not set, start measurements immediately */
    if(! flag_roi) {
@@ -338,7 +348,7 @@ void query_nvml_device(int device, long long delta) {
       }
    }
 
-   fprintf(stderr,"%f ",(double)power_usage/1000);
+   fprintf(out,"%f ",(double)power_usage/1000);
 }
 
 void close_and_exit(int code) {
@@ -364,12 +374,12 @@ void alarm_handler (int signo)
 
    now = (time.tv_sec-last_time.tv_sec)+(time.tv_usec-last_time.tv_usec)*1e-6;
    if(before == 0) before = now-interval;
-   fprintf(stderr,"%f ",(double) now);
+   fprintf(out,"%f ",(double) now);
    for(i=0; i<core_count; i++)
       query_rapl_device(i,(now-before)*1e6);
    for(i=0; i<device_count; i++)
       query_nvml_device(i,interval);
-   fprintf(stderr,"\n");
+   fprintf(out,"\n");
    before = now;
 }
 
@@ -490,7 +500,7 @@ void query_rapl_device(int core,long long delta) {
    for(i=0;i<NUM_RAPL_DOMAINS;i++) {
       if (fd[core][i]!=-1) {
          read(fd[core][i],&value,8);
-         fprintf(stderr,"%lf ",(double)(value-last_value[core][i])*scale[i]/delta/1e-6);
+         fprintf(out,"%lf ",(double)(value-last_value[core][i])*scale[i]/delta/1e-6);
          last_value[core][i] = value;
       }
    }

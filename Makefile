@@ -1,6 +1,7 @@
 
 TARGET = sauna
-LIBS = -lnvidia-ml
+LIBS = -lnvidia-ml -lmicmgmt
+#EXTRA_LDFLAGS = $(LDFLAGS) -lscif -lmicmgmt
 CC = gcc
 CFLAGS = -g -Wall -I/usr/include/nvidia/gdk
 

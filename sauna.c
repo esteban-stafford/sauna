@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <nvml.h>
+#include <miclib.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/time.h>
@@ -23,7 +24,7 @@
 /* Global variables */
 
 /* BEGIN CONFGURATION */
-#define VERSION "1.2"
+#define VERSION "1.3"
 //#define VERBOSE 1
 /* default interval beween measurements */
 useconds_t interval = 500000;
@@ -38,13 +39,19 @@ nvmlDevice_t device_list[4];
 unsigned int device_count;
 /* Cumulative energy for NVIDIA devices */
 double nvml_energy[4];
+/* Cumulative energy for MIC devices */
+double mic_energy;
 /* Flag to know if perf RAPL events have been initialized */
 int rapl_up = 0;
+/* Flag to know if mic connection has been initialized */
+int mic_up = 0;
 /* The last time a measurement was made. Needed to convert energy to power in RAPL measurements */
 struct timeval last_time;
 /* Number of cores detected in the machine */
 int core_count = 2;
 int query_cores[] = {0,6};
+/* Handle for the mic device */
+struct mic_device *mdh;
 
 /* Textual description of the RAPL domains */
 #define NUM_RAPL_DOMAINS	4
@@ -69,9 +76,13 @@ FILE *out;
 void usage(int argc, char **argv);
 void help(int argc, char **argv);
 int list_nvidia_devices(nvmlDevice_t *device_list, unsigned int *device_count);
+int init_mic();
 void reset_nvml();
+void reset_mic();
+void query_mic_device_power(long long delta);
 void query_nvml_device_power(int device, long long delta);
 void query_nvml_device_energy(int device);
+void query_mic_device_energy();
 void close_and_exit();
 void alarm_handler (int signo);
 void print_total_energy();
@@ -80,6 +91,8 @@ void reset_rapl_perf();
 void query_rapl_device_power(int core,long long delta);
 void query_rapl_device_energy(int core);
 void close_rapl_perf();
+int close_mic();
+void print_mic_error(const char *msg, const char *device_name);
 
 int main(int argc, char **argv)
 {
@@ -212,6 +225,12 @@ int main(int argc, char **argv)
       close_and_exit (0);
    }
 
+   /* Initialize perf RAPL */
+   if(init_mic() < 0) {
+      printf ("Error: Failed to intialize perf RAPL events.\n");
+      close_and_exit (0);
+   }
+
    /* Fork child process */
    if((child_id = fork()) < 0) {
       printf ("Error: unable to fork child process.\n");
@@ -250,6 +269,7 @@ int main(int argc, char **argv)
       }
    for(i=0; i<device_count; i++)
      fprintf(out," nvd_%d",i);
+   fprintf(out," mic");
    fprintf(out,"\n");
 
    /* If the ROI analysis flag is not set, start measurements immediately */
@@ -363,6 +383,10 @@ void reset_nvml() {
       nvml_energy[i] = 0;
 }
  
+void reset_mic() {
+   mic_energy = 0;
+}
+ 
 void query_nvml_device_power(int device, long long delta) {
    nvmlReturn_t result;
    unsigned int power_usage;
@@ -379,8 +403,35 @@ void query_nvml_device_power(int device, long long delta) {
    fprintf(out,"%f ",(double)power_usage/1000);
 }
 
+void query_mic_device_power(long long delta) {
+   struct mic_power_util_info *pinfo;
+   uint32_t power_usage;
+
+   /* Power utilization examples */
+   if (mic_get_power_utilization_info(mdh, &pinfo) != E_MIC_SUCCESS) {
+      print_mic_error("Failed to get power utilization information",
+            mic_get_device_name(mdh));
+      close_and_exit(0);
+   }
+
+   if (mic_get_inst_power_readings(pinfo, &power_usage) != E_MIC_SUCCESS) {
+      print_mic_error("Failed to get instant power readings",
+            mic_get_device_name(mdh));
+      (void)mic_free_power_utilization_info(pinfo);
+      close_and_exit(0);
+   }
+   mic_energy += (double)power_usage/1000000*delta*1e-6;
+   fprintf(out,"%f ",(double)power_usage/1000000);
+
+   (void)mic_free_power_utilization_info(pinfo);
+}
+
 void query_nvml_device_energy(int device) {
    fprintf(out,"%f ",nvml_energy[device]);
+}
+
+void query_mic_device_energy() {
+   fprintf(out,"%f ",mic_energy);
 }
 
 void close_and_exit(int code) {
@@ -392,8 +443,27 @@ void close_and_exit(int code) {
    }
    if(rapl_up)
       close_rapl_perf();
+   if(mic_up)
+      close_mic();
    exit(code);
 }
+
+void print_mic_error(const char *msg, const char *device_name)
+{
+    const char *mic_err_str = mic_get_error_string();
+
+    fprintf(stderr, "Error");
+    if (device_name != NULL)
+        fprintf(stderr, ": %s", device_name);
+    fprintf(stderr, ": %s", msg);
+    if (strcmp("No error registered", mic_err_str) != 0)
+        fprintf(stderr, ": %s", mic_err_str);
+    if (errno == 0)
+        fprintf(stderr, "\n");
+    else
+        fprintf(stderr, ": %s\n", strerror(errno));
+}
+
 
 void alarm_handler (int signo)
 {
@@ -411,6 +481,7 @@ void alarm_handler (int signo)
       query_rapl_device_power(i,(now-before)*1e6);
    for(i=0; i<device_count; i++)
       query_nvml_device_power(i,interval);
+   query_mic_device_power(interval);
    fprintf(out,"\n");
    before = now;
 }
@@ -427,6 +498,7 @@ void print_total_energy() {
       query_rapl_device_energy(i);
    for(i=0; i<device_count; i++)
       query_nvml_device_energy(i);
+   query_mic_device_energy();
    fprintf(out,"\n");
 }
 
@@ -435,6 +507,81 @@ int perf_event_open(struct perf_event_attr *hw_event_uptr,
 
         return syscall(__NR_perf_event_open,hw_event_uptr, pid, cpu,
                         group_fd, flags);
+}
+
+int init_mic()
+{
+   int ncards, card_num, card;
+   struct mic_devices_list *mdl;
+   int ret;
+   uint32_t device_type;
+
+   ret = mic_get_devices(&mdl);
+   if (ret == E_MIC_DRIVER_NOT_LOADED) {
+      fprintf(stderr, "Error: The driver is not loaded! ");
+      fprintf(stderr, "Load the driver before using this tool.\n");
+      return 1;
+   } else if (ret == E_MIC_ACCESS) {
+      fprintf(stderr, "Error: Access is denied to the driver! ");
+      fprintf(stderr, "Do you have permissions to access the driver?\n");
+      return 1;
+   } else if (ret != E_MIC_SUCCESS) {
+      fprintf(stderr, "Failed to get cards list: %s: %s\n",
+            mic_get_error_string(), strerror(errno));
+      return 1;
+   }
+
+   if (mic_get_ndevices(mdl, &ncards) != E_MIC_SUCCESS) {
+      print_mic_error("Failed to get number of cards", NULL);
+      (void)mic_free_devices(mdl);
+      return 2;
+   }
+
+   if (ncards == 0) {
+      print_mic_error("No MIC card found", NULL);
+      (void)mic_free_devices(mdl);
+      return 3;
+   }
+
+   /* Get card at index 0 */
+   card_num = 0;
+   if (mic_get_device_at_index(mdl, card_num, &card) != E_MIC_SUCCESS) {
+      fprintf(stderr, "Error: Failed to get card at index %d: %s: %s\n",
+            card_num, mic_get_error_string(), strerror(errno));
+      mic_free_devices(mdl);
+      return 4;
+   }
+
+   (void)mic_free_devices(mdl);
+
+   if (mic_open_device(&mdh, card) != E_MIC_SUCCESS) {
+      fprintf(stderr, "Error: Failed to open card %d: %s: %s\n",
+            card_num, mic_get_error_string(), strerror(errno));
+      return 5;
+   }
+
+   if (mic_get_device_type(mdh, &device_type) != E_MIC_SUCCESS) {
+      print_mic_error("Failed to get device type", mic_get_device_name(mdh));
+      (void)mic_close_device(mdh);
+      return 6;
+   }
+
+   if (device_type != KNC_ID) {
+      fprintf(stderr, "Error: Unknown device Type: %u\n", device_type);
+      (void)mic_close_device(mdh);
+      return 7;
+   }
+   //printf("    Found KNC device '%s'\n", mic_get_device_name(mdh));
+   mic_energy = 0;
+   mic_up = 0;
+   return 0;
+}
+
+int close_mic()
+{
+
+    (void)mic_close_device(mdh);
+    return 0;
 }
 
 int init_rapl_perf() {

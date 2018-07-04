@@ -1,9 +1,19 @@
-
 TARGET = sauna
-LIBS = -lnvidia-ml -lmicmgmt
-#EXTRA_LDFLAGS = $(LDFLAGS) -lscif -lmicmgmt
+
 CC = gcc
-CFLAGS = -g -Wall -I/usr/include/nvidia/gdk
+CFLAGS = -g -Wall
+
+NVIDIA = 1
+XEONPHI = 1
+
+ifeq ($(NVIDIA),1)
+   CFLAGS += -DNVIDIA -I/usr/include/nvidia/gdk
+   LIBS += -lnvidia-ml
+endif
+ifeq ($(XEONPHI),1)
+   CFLAGS += -DXEONPHI -I/usr/include/nvidia/gdk
+   LIBS += -lmicmgmt
+endif
 
 .PHONY: default all clean
 

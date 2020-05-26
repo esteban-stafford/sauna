@@ -1,4 +1,4 @@
-#Sauna
+# Sauna
 
 An tool to measure energy the consumption of CPUs, GPUs and XeonPhi.
 
@@ -11,7 +11,7 @@ The energy measurements of the CPUs is done through the Running Average Power Li
 To access the Nvidia GPUs and XeonPhi, Sauna uses two libraries provided by both manufacturers. From Nvidia, Sauna requires the [GDK](https://developer.nvidia.com/gpu-deployment-kit). And from Intel, the [XeonPhi Library]() must be installed.
 
 
-##Building
+## Building
 
 The Makefile easies the building process. To build the complete Sauna, simply type:
 
@@ -25,7 +25,7 @@ Building of the Nvidia or XeonPhi modules can be disabled on the command line by
 $ make XEONPHI=1 NVIDIA=0
 ```
 
-##Running
+## Running
 
 At the very minimum Sauna takes one argument. It is the program to run while it performs the measurements. Without any arguments it shows a brief usage guide. A more detalied user guide can be obtained with '-h'.
 

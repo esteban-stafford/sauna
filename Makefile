@@ -11,7 +11,7 @@ ifeq ($(NVIDIA),1)
    LIBS += -lnvidia-ml
 endif
 ifeq ($(XEONPHI),1)
-   CFLAGS += -DXEONPHI -I/usr/include/nvidia/gdk
+   CFLAGS += -DXEONPHI
    LIBS += -lmicmgmt
 endif
 

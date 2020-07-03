@@ -37,7 +37,7 @@ $ sudo sauna sleep 5
 
 The default sampling interval is 500ms. Other values can be set with '-i'. However be aware that using short intervals can impose a significant overhead. This is particularly noticeable in Nvidia devices. Evaluation of the overhead is recommended if the interval is lower than 100ms.
 
-By default Sauna takes measurements throughout the execution, but this can be restricted to a \emph{Region Of Interest(ROI)} with '-r'. The ROI is determined by the program itself by special strings written to standard output. Care must be taken in this case to flush the output after printing these strings so that the monitor can read them as soon as possible.
+By default Sauna takes measurements throughout the execution, but this can be restricted to a *Region Of Interest(ROI)* with '-r'. The ROI is determined by the program itself by special strings written to standard output. Care must be taken in this case to flush the output after printing these strings so that the monitor can read them as soon as possible.
 
 
 ## Authors

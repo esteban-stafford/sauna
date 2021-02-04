@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <linux/perf_event.h>
 
 #if NVIDIA
@@ -52,8 +53,8 @@ struct mic_device *mdh;
 /* The last time a measurement was made. Needed to convert energy to power in RAPL measurements */
 struct timeval last_time;
 /* Number of cores detected in the machine */
-int core_count = 2;
-int query_cores[] = {0,6};
+int core_count = 0;
+int query_cores[MAX_CORES];
 
 /* Textual description of the RAPL domains */
 #define NUM_RAPL_DOMAINS	4
@@ -137,11 +138,23 @@ int main(int argc, char **argv)
    /* Set default output file */
    out = stderr;
 
+   /* Get number of cores */
+   core_count = get_nprocs();
+   if(core_count > MAX_CORES) {
+      fprintf(stderr,"Too many processors. Increase MAX_CORES and recompile.\n");
+      return -1;
+   }
+   for(i=0; i<core_count; i++) {
+      query_cores[i] = i;
+   }
+
    /* Disable getopt error reporting */
    opterr = 0;
    /* Process options with getopt */
    while ((c = getopt (argc, argv, "o::c::r::h::v::i::t::")) != -1)
+
       switch (c) {
+         char *it,*end;
          case 'o':
             if((out = fopen(optarg,"w")) == NULL) {
                fprintf(stderr,"Could not open output file %s for writing. %s\n", optarg, strerror(errno));
@@ -154,15 +167,28 @@ int main(int argc, char **argv)
          case 't':
             flag_total = 1;
             break;
-/*         case 'c':
-            endp = NULL;
-            l = -1;
-            if (!optarg || (l=strtol(optarg, &endp, 10)), (endp && *endp)) {
-               fprintf(stderr,"Invalid core count %s - expecting a number.\n", optarg?optarg:"(null)");
-               close_and_exit(EXIT_FAILURE);
+         case 'c':
+            if(optarg == NULL || *optarg == '\0') break;
+            it = optarg;
+            end = optarg;
+            int i = 0;
+            while(*end) {
+               int n = strtol(it, &end, 10);
+               if(n > core_count) {
+                  fprintf(stderr,"Specified a core that does not exisit.\n");
+                  close_and_exit(EXIT_FAILURE);
+               }
+               query_cores[i++] = n;
+               if(i > core_count) {
+                  fprintf(stderr,"Specified too many cores.\n");
+                  close_and_exit(EXIT_FAILURE);
+               }
+               while (*end == ',') { end++; }
+               it = end;
             }
-            core_count = l;
-            break; */
+            core_count = i;
+            // for(i = 0; i < core_count; i++) fprintf(stderr,"%d\n",query_cores[i]);
+            break;
          case 'i':
             endp = NULL;
             l = -1;
@@ -639,12 +665,6 @@ int init_rapl_perf() {
    }
    fscanf(fff,"%d",&type);
    fclose(fff);
-
-/*   core_count = sysconf(_SC_NPROCESSORS_ONLN);
-   if(core_count > MAX_CORES) {
-      fprintf(stderr,"Too many processors. Increase MAX_CORES and recompile.\n");
-      return -1;
-   } */
 
    for(i=0; i<core_count; i++) {
       for(j=0;j<NUM_RAPL_DOMAINS;j++) {
